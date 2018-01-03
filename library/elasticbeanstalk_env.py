@@ -47,9 +47,19 @@ options:
       - if specified, the environment attempts to use this value as the prefix for the CNAME. If not specified, the environment uses the environment name.
     required: false
     default: null
+  vpc:
+    description:
+      - id or name of vpc. If not found, a ValueError is raised. If found, the vpc_id is added to option_settings
+    required: false
+    default: null
+  vpc_subnets:
+    description:
+      - comma seperated list of ids or names of vpc subnets. If no subnet is found, a ValueError is raised. If found, but vpc_id is not the same as vpc, a ValueError is raised, else vpc_subnet_id is added to option_settings.
+    required: false
+    default: null
   option_settings:
     description:
-      - 'A dictionary array of settings to add of the form: { Namespace: ..., OptionName: ... , Value: ... }. If specified, AWS Elastic Beanstalk sets the specified configuration options to the requested value in the configuration set for the new environment. These override the values obtained from the solution stack or the configuration template'
+      - 'An array of dictionaries of the form: { Namespace: ..., OptionName: ... , Value: ... }. If specified, AWS Elastic Beanstalk sets the specified configuration options to the requested value in the configuration set for the new environment. These override the values obtained from the solution stack or the configuration template'
     required: false
     default: null
   tags:
@@ -82,6 +92,8 @@ EXAMPLES = '''
     env_name: sampleApp-env
     version_label: Sample Application
     solution_stack_name: "64bit Amazon Linux 2014.09 v1.2.1 running Docker 1.5.0"
+    vpc: VPC_NAME
+    vpc_subnets: SUBNET_NAME1,SUBNET_NAME2
     option_settings:
       - Namespace: aws:elasticbeanstalk:application:environment
         OptionName: PARAM1
@@ -284,6 +296,49 @@ def check_env(ebs, app_name, env_name, module):
 def filter_empty(**kwargs):
     return {k:v for k,v in kwargs.items() if v}
 
+
+def getVpcId(region, vpc, option_settings, ansible_module):
+    ansible_module.debug("searching for vpc_id='{}'".format(vpc))
+    ec2 = boto3.resource('ec2', region_name=region)
+    try:
+        vpc_id = list(ec2.vpcs.filter(VpcIds=[vpc]))[0].vpc_id
+    except ClientError:
+        ansible_module.debug("searching for vpc_name='{}'".format(vpc))
+        filters = [{'Name':'tag:Name', 'Values':[vpc]}]
+        try:
+            vpc_id = list(ec2.vpcs.filter(Filters=filters))[0].vpc_id
+        except ClientError:
+            raise ValueError("VPC '{}' not found".format(vpc))
+    option_settings.append({'Namespace':'aws:ec2:vpc', 'OptionName':'VPCId', 'Value':vpc_id})
+    return vpc_id
+
+def checkVpcSubnetIds(region, vpc_subnets, vpc_id, option_settings, ansible_module):
+    ansible_module.debug("searching for vpc_subnet_ids='{}'".format(vpc_subnets))
+    ec2 = boto3.resource('ec2', region_name=region)
+    try:
+        subnets_tmp = list(ec2.subnets.filter(SubnetIds=vpc_subnets))
+    except ClientError:
+        ansible_module.debug("searching for vpc_subnet_names='{}'".format(vpc_subnets))
+        filters=[{'Name': 'tag:Name', 'Values': vpc_subnets}]
+        try:
+            subnets_tmp = list(ec2.subnets.filter(Filters=filters))
+        except ClientError:
+            raise ValueError("VPC Subnets '{}' not found".format(vpc_subnets))
+        
+    if vpc_id:
+        for vpc_subnet in subnets_tmp:
+            if vpc_subnet.vpc_id != vpc_id:
+                raise ValueError("VPC Subnets '{}' not part of VPC '{}'".format(vpc_subnet.vpc_id, vpc_id))
+    else:
+        option_settings.append({'Namespace':'aws:ec2:vpc', 'OptionName':'VPCId', 'Value':subnets_tmp[0].vpc_id})
+        
+    subnetIds = [vpc_subnet.subnet_id for vpc_subnet in subnets_tmp]
+    
+    if not subnetIds:
+        raise ValueError("VPC Subnets '{}' not found".format(vpc_subnets))
+    
+    option_settings.append({'Namespace':'aws:ec2:vpc', 'OptionName':'Subnets', 'Value':','.join(subnetIds)})
+       
 def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(dict(
@@ -296,6 +351,8 @@ def main():
             template_name  = dict(type='str', required=False),
             solution_stack_name = dict(type='str', required=False),
             cname_prefix = dict(type='str', required=False),
+            vpc = dict(type='str', required=False),
+            vpc_subnets = dict(type='str', required=False),
             option_settings = dict(type='list',default=[]),
             tags = dict(type='dict',default=dict()),
             options_to_remove = dict(type='list',default=[]),
@@ -318,6 +375,8 @@ def main():
     template_name = module.params['template_name']
     solution_stack_name = module.params['solution_stack_name']
     cname_prefix = module.params['cname_prefix']
+    vpc = module.params['vpc']
+    vpc_subnets = module.params['vpc_subnets']
     tags = module.params['tags']
     option_settings = module.params['option_settings']
     options_to_remove = module.params['options_to_remove']
@@ -328,12 +387,23 @@ def main():
     if tier_name == 'Worker':
         tier_type = 'SQS/HTTP'
 
+    
     region, ec2_url, aws_connect_params = get_aws_connection_info(module, boto3=True)
     if region:
         ebs = boto3_conn(module, conn_type='client', resource='elasticbeanstalk',
                 region=region, endpoint=ec2_url, **aws_connect_params)
     else:
         module.fail_json(msg='region must be specified')
+
+    if vpc:
+        vpc_id = getVpcId(region, vpc, option_settings, module)
+    else:
+        vpc_id = None
+    
+    module.debug("found vpc_id="+vpc_id)
+
+    if vpc_subnets:
+        checkVpcSubnetIds(region, vpc_subnets.split(','), vpc_id, option_settings, module)
 
     update = False
     result = {}
