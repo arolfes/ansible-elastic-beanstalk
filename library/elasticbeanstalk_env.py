@@ -245,9 +245,9 @@ def update_required(ebs, env, params):
     if params["version_label"] and env["VersionLabel"] != params["version_label"]:
         updates.append(('VersionLabel', env['VersionLabel'], params['version_label']))
 
-    if params.get("template_name", None) and not env.has_key("TemplateName"):
+    if params.get("template_name", None) and not "TemplateName" in env:
         updates.append(('TemplateName', None, params['template_name']))
-    elif env.has_key("TemplateName") and env["TemplateName"] != params["template_name"]:
+    elif "TemplateName" in env and env["TemplateName"] != params["template_name"]:
         updates.append(('TemplateName', env['TemplateName'], params['template_name']))
 
     result = ebs.describe_configuration_settings(ApplicationName=params["app_name"],
